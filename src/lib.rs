@@ -110,6 +110,10 @@ impl ToScan {
         self.prefilter = Some(filter)
     }
 
+    pub fn set_batchsize(&mut self, batch: usize) {
+        self.batch_size = batch;
+    }
+
     fn is_empty(&self) -> bool {
         self.phy_sorted.is_empty() && self.unordered.is_empty() && self.current_dir.is_none()
     }
@@ -198,6 +202,7 @@ impl Iterator for ToScan {
                         //print!{"{} {} ", entry.to_string_lossy(), meta.st_ino()};
                         match get_file_extent_map_for_path(to_add.path()) {
                             Ok(ref extents) if !extents.is_empty() => {
+                                // println!{"{} phys: {} ", entry.to_string_lossy(), extents[0].physical};
                                 self.add(to_add, Some(extents[0].physical));
                             },
                             _ => {
@@ -250,7 +255,7 @@ impl Iterator for ToScan {
                     return Some(Ok(dent))
                 },
                 Order::Content => {
-                    for e in self.inode_ordered.drain(0..) {
+                    for e in self.inode_ordered.drain(0..).rev() {
                         let offset = match get_file_extent_map_for_path(e.path()) {
                             Ok(ref extents) if !extents.is_empty() => extents[0].physical,
                             _ => 0
