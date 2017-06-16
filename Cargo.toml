@@ -1,6 +1,6 @@
 [package]
 name = "platter-walk"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["The 8472"]
 description = "Directory tree traversal optimized for HDDs"
 keywords = ["linux", "ext4"]
@@ -18,4 +18,4 @@ include = [
 
 
 [dependencies]
-btrfs = "1.2.1"
+btrfs = { git = "https://github.com/the8472/rust-btrfs.git", branch = "fix-ioctl-dep" }
