@@ -18,4 +18,4 @@ include = [
 
 
 [dependencies]
-btrfs = { git = "https://github.com/the8472/rust-btrfs.git", branch = "fix-ioctl-dep" }
+btrfs = { path = "./rust-btrfs", version = "1.2.1" }
