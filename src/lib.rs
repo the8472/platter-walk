@@ -4,32 +4,34 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
-extern crate btrfs;
+extern crate btrfs2 as btrfs;
+extern crate mnt;
+extern crate libc;
 
-use btrfs::linux::{get_file_extent_map_for_path};
+use btrfs::linux::{get_file_extent_map_for_path, FileExtent};
 use std::fs::*;
 use std::os::unix::fs::DirEntryExt;
 use std::path::PathBuf;
-use std::collections::VecDeque;
-use std::collections::BTreeMap;
-use std::collections::Bound::Included;
-use std::error::Error;
-use std::io::Write;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::Bound::{Included, Excluded};
 use std::path::Path;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 
 pub struct Entry {
     path: PathBuf,
     ftype: FileType,
-    ino: u64
+    ino: u64,
+    extents: Vec<FileExtent>,
 }
 
 impl Entry {
-    pub fn new(buf: PathBuf, ft: FileType, ino: u64) -> Entry {
+    pub fn new(buf: PathBuf, ft: FileType, ino: u64, extents: Vec<FileExtent>) -> Entry {
         Entry {
             path: buf,
             ftype: ft,
-            ino :ino
+            ino :ino,
+            extents: extents
         }
     }
 
@@ -44,6 +46,22 @@ impl Entry {
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
+
+    fn extent_sum(&self) -> u64 {
+        self.extents.iter().map(|e| e.length).sum()
+    }
+}
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Entry) -> bool {
+        return self.path.eq(&other.path)
+    }
+}
+
+impl PartialEq<Path> for Entry {
+    fn eq(&self, p: &Path) -> bool {
+        return self.path.eq(p)
+    }
 }
 
 pub struct ToScan {
@@ -56,7 +74,10 @@ pub struct ToScan {
     prefilter: Option<Box<Fn(&Path, &FileType) -> bool>>,
     phase: Phase,
     order: Order,
-    batch_size: usize
+    batch_size: usize,
+    prefetched: HashMap<PathBuf, u64>,
+    mountpoints: Vec<mnt::MountEntry>,
+    prefetch_cap: usize
 }
 
 #[derive(PartialEq, Copy, Clone)]
@@ -97,13 +118,31 @@ impl ToScan {
             order: Dentries,
             phase: Phase::DirWalk,
             batch_size: 1024,
-            prefilter: None
+            prefilter: None,
+            prefetched: Default::default(),
+            mountpoints: vec![],
+            prefetch_cap: 0
         }
     }
 
     pub fn set_order(&mut self, ord: Order) -> &mut Self {
         self.order = ord;
         self
+    }
+
+    pub fn prefetch_dirs(&mut self, val: bool) {
+        if !val {
+            self.mountpoints = vec![];
+            return;
+        }
+
+        self.mountpoints = match mnt::MountIter::new_from_proc() {
+            Ok(m) => m,
+            Err(_) => {
+                self.mountpoints = vec![];
+                return
+            }
+        }.filter_map(|e| e.ok()).collect();
     }
 
     pub fn set_prefilter(&mut self, filter: Box<Fn(&Path, &FileType) -> bool>) {
@@ -120,22 +159,142 @@ impl ToScan {
 
     pub fn add_root(&mut self, path : PathBuf) -> std::io::Result<()> {
         let meta = std::fs::metadata(&path)?;
-        self.add(Entry{path: path, ino: meta.ino(), ftype: meta.file_type()}, None);
+        self.add(Entry{path: path, ino: meta.ino(), ftype: meta.file_type(), extents: vec![]}, None);
         Ok(())
     }
 
     fn get_next(&mut self) -> Option<Entry> {
+        self.prefetch();
+
         if !self.unordered.is_empty() {
-            return self.unordered.pop_front();
+            let res = self.unordered.pop_front();
+            self.remove_prefetch(&res);
+            return res;
         }
 
         let next_key = self.phy_sorted.range((Included(&self.cursor), Included(&std::u64::MAX))).next().map(|(k,_)| *k);
         if let Some(k) = next_key {
             self.cursor = k;
-            return self.phy_sorted.remove(&k);
+            let res = self.phy_sorted.remove(&k);
+            self.remove_prefetch(&res);
+            return res;
         }
 
         None
+    }
+
+    fn remove_prefetch(&mut self, e : &Option<Entry>) {
+        if let &Some(ref e) = e {
+            if let Some(_) = self.prefetched.remove(e.path()) {
+                self.prefetch_cap = std::cmp::min(2048,self.prefetch_cap * 2 + 1);
+            } else {
+                self.prefetch_cap = 2;
+                self.prefetched.clear();
+            }
+
+        }
+    }
+
+    fn prefetch(&mut self) {
+        if self.mountpoints.is_empty() {
+            return;
+        }
+
+        const LIMIT : u64 = 8*1024*1024;
+
+        let consumed = self.prefetched.iter().map(|ref tuple| tuple.1).sum::<u64>();
+        let mut remaining = LIMIT.saturating_sub(consumed);
+        let prev_fetched = self.prefetched.len();
+
+        // hysteresis
+        if remaining < LIMIT/2 {
+            return;
+        }
+
+        let unordered_iter = self.unordered.iter();
+        let ordered_iter_front = self.phy_sorted.range((Included(&self.cursor), Included(&std::u64::MAX))).map(|(_,v)| v);
+        let ordered_iter_tail = self.phy_sorted.range((Included(&0), Excluded(&self.cursor))).map(|(_,v)| v);
+
+        let mut prune = vec![];
+
+        {
+            let mut device_groups = HashMap::new();
+
+            for e in unordered_iter.chain(ordered_iter_front).chain(ordered_iter_tail) {
+                if remaining == 0 {
+                    break;
+                }
+
+                if self.prefetched.len() > self.prefetch_cap + 1 {
+                    break;
+                }
+
+                if self.prefetched.contains_key(e.path()) {
+                    continue;
+                }
+
+                let size = e.extent_sum();
+                remaining = remaining.saturating_sub(size);
+                self.prefetched.insert(e.path().to_owned(), size);
+
+                let mount = self.mountpoints.iter().rev().find(|mnt| e.path().starts_with(&mnt.file));
+
+                // TODO: only try to open devices once
+                match mount {
+                    Some(&mnt::MountEntry {ref spec, ref vfstype, ..})
+                    if vfstype == "ext4" || vfstype == "ext3"
+                    => {
+                        let mount_slot = device_groups.entry(spec).or_insert(vec![]);
+                        mount_slot.extend(&e.extents);
+                    }
+                    _ => {}
+                }
+            }
+
+            for (p, extents) in device_groups {
+                let mut ordered_extents = extents.to_vec();
+                ordered_extents.sort_by_key(|e| e.physical);
+
+                if let Ok(f) = File::open(p) {
+
+                    let mut i = 0;
+
+                    while i < ordered_extents.len() {
+                        let ext1 = ordered_extents[i];
+                        let offset = ext1.physical;
+                        let mut end = offset + ext1.length;
+
+                        for j in i+1..ordered_extents.len() {
+                            let ref ext2 = ordered_extents[j];
+                            if ext2.physical > end {
+                                break;
+                            }
+
+                            i = j;
+
+                            end = ext2.physical+ext2.length;
+                        }
+
+                        i+=1;
+
+                        unsafe {
+                            libc::posix_fadvise(f.as_raw_fd(), offset as i64, (end - offset) as i64, libc::POSIX_FADV_WILLNEED);
+                        }
+                    }
+                } else {
+                    prune.push(p.to_owned());
+                }
+            }
+
+        }
+
+        //println!("bytes: {} -> {}, f: {}->{}, sc: {}", LIMIT-consumed, remaining, prev_fetched ,self.prefetched.len(), self.prefetch_cap);
+
+        if prune.len() > 0 {
+            self.mountpoints.retain(|e| prune.contains(&e.spec));
+        }
+
+
     }
 
     pub fn add(&mut self, to_add : Entry, pos : Option<u64>) {
@@ -198,20 +357,21 @@ impl Iterator for ToScan {
                     // TODO: Better phase-switching?
                     // move to inode pass? won't start the next dir before this one is done anyway
                     if meta.is_dir() {
-                        let to_add = Entry::new(dent.path(), meta, dent.ino());
-                        //print!{"{} {} ", entry.to_string_lossy(), meta.st_ino()};
-                        match get_file_extent_map_for_path(to_add.path()) {
-                            Ok(ref extents) if !extents.is_empty() => {
-                                // println!{"{} phys: {} ", entry.to_string_lossy(), extents[0].physical};
-                                self.add(to_add, Some(extents[0].physical));
-                            },
-                            _ => {
-                                // TODO: fall back to inode-order? depth-first?
-                                // skip adding non-directories in content order?
-                                //self.add(entry, Some(de.ino()))
-                                self.add(to_add , None);
 
-                            }
+                        let extents = match get_file_extent_map_for_path(dent.path()) {
+                            Ok(extents) => extents,
+                            _ => vec![]
+                        };
+
+                        let to_add = Entry::new(dent.path(), meta, dent.ino(), extents);
+
+                        if { !to_add.extents.is_empty() } {
+                            let offset = to_add.extents[0].physical;
+                            self.add(to_add, Some(offset));
+                        } else {
+                            // TODO: fall back to inode-order? depth-first?
+                            // skip adding non-directories in content order?
+                            self.add(to_add, None);
                         }
 
 
@@ -225,10 +385,10 @@ impl Iterator for ToScan {
 
                     match self.order {
                         Order::Dentries => {
-                            return Some(Ok(Entry::new(dent.path(), meta, dent.ino())))
+                            return Some(Ok(Entry::new(dent.path(), meta, dent.ino(), vec![])))
                         }
                         Order::Inode | Order::Content => {
-                            self.inode_ordered.push(Entry::new(dent.path(), meta, dent.ino()));
+                            self.inode_ordered.push(Entry::new(dent.path(), meta, dent.ino(), vec![]));
                         }
                     }
                 }

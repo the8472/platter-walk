@@ -1,4 +1,0 @@
-[submodule "rust-btrfs"]
-	path = rust-btrfs
-	url = https://github.com/the8472/rust-btrfs.git
-	branch = fix-ioctl-dep

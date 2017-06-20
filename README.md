@@ -3,7 +3,11 @@
 # platter-walk
 
 A recursive directory entry iterator that optimizes traversal based on physical disk layout.
-Takes block offsets (via FIEMAP), inode tables and disk cache locality into account.
+Takes block offsets (via FIEMAP[[1]](https://github.com/torvalds/linux/commit/abc8746eb91fb01e8d411896f80f7687c0d8372e)), inode tables and disk cache locality into account.
+
+For users (root) who have read access to the underlying block device it also performs readaheads on the directory indicies
+spanning several directories. This is somewhat of a hack since `readahead()` and `posix_fadvise()` do not work on directories directly
+since they use a separate cache.[[2]](https://www.spinics.net/lists/linux-fsdevel/msg30843.html)[[3]](https://www.spinics.net/lists/linux-fsdevel/msg31321.html)
 
 The largest benefits can be realized on HDDs with ext4 filesystems.
 
