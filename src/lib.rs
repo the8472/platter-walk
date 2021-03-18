@@ -13,7 +13,7 @@ use std::fs::*;
 use std::os::unix::fs::DirEntryExt;
 use std::path::PathBuf;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::collections::Bound::{Included, Excluded};
+use std::ops::Bound::{Included, Excluded};
 use std::path::Path;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
