@@ -30,8 +30,8 @@ impl Entry {
         Entry {
             path: buf,
             ftype: ft,
-            ino :ino,
-            extents: extents
+            ino,
+            extents
         }
     }
 
@@ -54,13 +54,13 @@ impl Entry {
 
 impl PartialEq for Entry {
     fn eq(&self, other: &Entry) -> bool {
-        return self.path.eq(&other.path)
+        self.path.eq(&other.path)
     }
 }
 
 impl PartialEq<Path> for Entry {
     fn eq(&self, p: &Path) -> bool {
-        return self.path.eq(p)
+        self.path.eq(p)
     }
 }
 
@@ -71,7 +71,7 @@ pub struct ToScan {
     cursor: u64,
     current_dir: Option<ReadDir>,
     inode_ordered: Vec<Entry>,
-    prefilter: Option<Box<Fn(&Path, &FileType) -> bool>>,
+    prefilter: Option<Box<dyn Fn(&Path, &FileType) -> bool>>,
     phase: Phase,
     order: Order,
     batch_size: usize,
@@ -145,7 +145,7 @@ impl ToScan {
         }.filter_map(|e| e.ok()).collect();
     }
 
-    pub fn set_prefilter(&mut self, filter: Box<Fn(&Path, &FileType) -> bool>) {
+    pub fn set_prefilter(&mut self, filter: Box<dyn Fn(&Path, &FileType) -> bool>) {
         self.prefilter = Some(filter)
     }
 
@@ -159,7 +159,7 @@ impl ToScan {
 
     pub fn add_root(&mut self, path : PathBuf) -> std::io::Result<()> {
         let meta = std::fs::metadata(&path)?;
-        self.add(Entry{path: path, ino: meta.ino(), ftype: meta.file_type(), extents: vec![]}, None);
+        self.add(Entry{path, ino: meta.ino(), ftype: meta.file_type(), extents: vec![]}, None);
         Ok(())
     }
 
@@ -172,7 +172,7 @@ impl ToScan {
             return res;
         }
 
-        let next_key = self.phy_sorted.range((Included(&self.cursor), Included(&std::u64::MAX))).next().map(|(k,_)| *k);
+        let next_key = self.phy_sorted.range((Included(&self.cursor), Included(&u64::MAX))).next().map(|(k,_)| *k);
         if let Some(k) = next_key {
             self.cursor = k;
             let res = self.phy_sorted.remove(&k);
@@ -184,8 +184,8 @@ impl ToScan {
     }
 
     fn remove_prefetch(&mut self, e : &Option<Entry>) {
-        if let &Some(ref e) = e {
-            if let Some(_) = self.prefetched.remove(e.path()) {
+        if let Some(ref e) = *e {
+            if self.prefetched.remove(e.path()).is_some() {
                 self.prefetch_cap = std::cmp::min(2048,self.prefetch_cap * 2 + 1);
             } else {
                 self.prefetch_cap = 2;
@@ -212,7 +212,7 @@ impl ToScan {
         }
 
         let unordered_iter = self.unordered.iter();
-        let ordered_iter_front = self.phy_sorted.range((Included(&self.cursor), Included(&std::u64::MAX))).map(|(_,v)| v);
+        let ordered_iter_front = self.phy_sorted.range((Included(&self.cursor), Included(&u64::MAX))).map(|(_,v)| v);
         let ordered_iter_tail = self.phy_sorted.range((Included(&0), Excluded(&self.cursor))).map(|(_,v)| v);
 
         let mut prune = vec![];
@@ -290,7 +290,7 @@ impl ToScan {
 
         //println!("bytes: {} -> {}, f: {}->{}, sc: {}", LIMIT-consumed, remaining, prev_fetched ,self.prefetched.len(), self.prefetch_cap);
 
-        if prune.len() > 0 {
+        if !prune.is_empty() {
             self.mountpoints.retain(|e| prune.contains(&e.spec));
         }
 
@@ -365,7 +365,7 @@ impl Iterator for ToScan {
 
                         let to_add = Entry::new(dent.path(), meta, dent.ino(), extents);
 
-                        if { !to_add.extents.is_empty() } {
+                        if !to_add.extents.is_empty() {
                             let offset = to_add.extents[0].physical;
                             self.add(to_add, Some(offset));
                         } else {
@@ -398,18 +398,18 @@ impl Iterator for ToScan {
                 assert!(self.order != Dentries);
                 self.phase = Phase::InodePass;
                 // reverse sort so we can pop
-                self.inode_ordered.sort_by_key(|dent| std::u64::MAX - dent.ino());
+                self.inode_ordered.sort_by_key(|dent| u64::MAX - dent.ino());
             }
         }
 
 
-        if self.phase == Phase::InodePass || (self.is_empty() && self.inode_ordered.len() > 0)  {
-            assert!(self.inode_ordered.len() > 0);
+        if self.phase == Phase::InodePass || (self.is_empty() && !self.inode_ordered.is_empty())  {
+            assert!(!self.inode_ordered.is_empty());
 
             match self.order {
                 Order::Inode => {
                     let dent = self.inode_ordered.pop().unwrap();
-                    if self.inode_ordered.len() == 0 {
+                    if self.inode_ordered.is_empty() {
                         self.phase = Phase::DirWalk;
                     }
                     return Some(Ok(dent))
@@ -424,26 +424,21 @@ impl Iterator for ToScan {
                     }
                     self.phy_sorted_leaves.sort_by_key(|pair| pair.0);
                     self.phase = Phase::ContentPass;
-                    assert!(self.phy_sorted_leaves.len() > 0);
+                    assert!(!self.phy_sorted_leaves.is_empty());
                 },
                 _ => {panic!("illegal state")}
             }
 
         }
 
-        if self.phase == Phase::ContentPass || (self.is_empty() && self.phy_sorted_leaves.len() > 0) {
-            assert!(self.phy_sorted_leaves.len() > 0);
+        if self.phase == Phase::ContentPass || (self.is_empty() && !self.phy_sorted_leaves.is_empty()) {
+            assert!(!self.phy_sorted_leaves.is_empty());
             let dent = self.phy_sorted_leaves.pop().unwrap().1;
-            if self.phy_sorted_leaves.len() == 0 {
+            if self.phy_sorted_leaves.is_empty() {
                 self.phase = Phase::DirWalk;
             }
             return Some(Ok(dent))
         }
-
-
-
-
-
 
         None
     }
