@@ -1,6 +1,6 @@
 [package]
 name = "platter-walk"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["The 8472"]
 description = "Directory tree traversal optimized for HDDs"
 keywords = ["linux", "ext4"]
